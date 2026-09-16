@@ -308,13 +308,24 @@ return { model, temporary };
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     };
+    validate_chatgpt_page(&verification)
+}
+
+/// ChatGPT may render the version and mode on separate lines in the model pill.
+/// Only accept known labels for the requested model, not arbitrary text containing Pro.
+fn is_expected_chatgpt_web_model(label: &str) -> bool {
+    let normalized = label.split_whitespace().collect::<Vec<_>>().join(" ");
+    matches!(normalized.as_str(), "Pro" | "5.6 Pro" | "GPT-5.6 Pro")
+}
+
+fn validate_chatgpt_page(verification: &Value) -> Result<()> {
     let selected_model = verification
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if selected_model != "Pro" {
+    if !is_expected_chatgpt_web_model(selected_model) {
         anyhow::bail!(
-            "ChatGPT did not select GPT-5.6 Pro (model picker showed '{}'). Confirm this workspace has GPT-5.6 Pro access",
+            "ChatGPT model selection did not match GPT-5.6 Pro (model picker showed {:?}). Check the selected model in Firefox.",
             if selected_model.is_empty() {
                 "unknown"
             } else {
@@ -331,7 +342,10 @@ return { model, temporary };
 }
 
 fn page_verification_ready(verification: &Value) -> bool {
-    verification.get("model").and_then(Value::as_str) == Some("Pro")
+    verification
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(is_expected_chatgpt_web_model)
         && verification.get("temporary").and_then(Value::as_bool) == Some(true)
 }
 
@@ -869,6 +883,77 @@ mod tests {
         assert!(!page_verification_ready(
             &json!({ "model": "Pro", "temporary": false })
         ));
+    }
+
+    #[test]
+    fn model_label_accepts_expected_pro_with_whitespace() {
+        for label in [
+            "Pro",
+            "5.6 Pro",
+            "GPT-5.6 Pro",
+            "5.6\nPro",
+            "  5.6\r\n\tPro  ",
+            "GPT-5.6\u{a0}Pro",
+            "5.6\u{2009}\u{202f}Pro",
+        ] {
+            assert!(is_expected_chatgpt_web_model(label), "label: {label:?}");
+        }
+    }
+
+    #[test]
+    fn model_label_rejects_unrelated_models_and_upgrade_text() {
+        for label in [
+            "",
+            " \n\t ",
+            "Instant",
+            "Thinking",
+            "5.6 Thinking",
+            "5.5 Pro",
+            "GPT-5.5 Pro",
+            "5.60 Pro",
+            "Upgrade to Pro",
+            "Pro plan",
+            "GPT-5.6 Pro extra",
+        ] {
+            assert!(!is_expected_chatgpt_web_model(label), "label: {label:?}");
+        }
+    }
+
+    #[test]
+    fn page_validation_accepts_versioned_model_labels() {
+        for label in ["Pro", "5.6\nPro", "GPT-5.6\u{a0}Pro"] {
+            let verification = json!({ "model": label, "temporary": true });
+            assert!(page_verification_ready(&verification), "label: {label:?}");
+            validate_chatgpt_page(&verification).expect("expected Pro page must validate");
+        }
+    }
+
+    #[test]
+    fn page_validation_rejects_malformed_or_non_temporary_state() {
+        for verification in [
+            json!({ "model": "5.6\nPro", "temporary": false }),
+            json!({ "model": "5.6\nPro" }),
+            json!({ "model": "5.6\nPro", "temporary": "true" }),
+            json!({ "model": "5.5 Pro", "temporary": true }),
+            json!({ "model": null, "temporary": true }),
+            json!({ "model": 56, "temporary": true }),
+            json!({ "temporary": true }),
+            json!({}),
+        ] {
+            assert!(!page_verification_ready(&verification), "{verification}");
+            assert!(validate_chatgpt_page(&verification).is_err(), "{verification}");
+        }
+    }
+
+    #[test]
+    fn page_validation_error_escapes_unrecognized_model_label() {
+        let error = validate_chatgpt_page(&json!({
+            "model": "5.5\nPro",
+            "temporary": true
+        }))
+        .expect_err("wrong version must remain rejected");
+        assert!(error.to_string().contains("5.5\\nPro"));
+        assert!(!error.to_string().contains("Confirm this workspace"));
     }
 
     #[test]
