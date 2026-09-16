@@ -5,6 +5,39 @@ use super::*;
 /// helps; hopping to the strongest Anthropic route often does.
 const GUARDRAIL_REROUTE_MODEL: &str = "claude-opus-4-8";
 
+/// Browser transport is independent of any saved OAuth/API-key credential.
+/// Use the active model, not stale session metadata, to recognize that route.
+fn route_api_method_for_active_model(
+    provider: Option<jcode_provider_core::ActiveProvider>,
+    model: &str,
+    credential: Option<jcode_provider_core::ResolvedCredential>,
+    session_api_method: Option<&str>,
+) -> Option<String> {
+    use jcode_provider_core::{ActiveProvider, ResolvedCredential};
+
+    if matches!(&provider, Some(ActiveProvider::OpenAI))
+        && model.trim() == jcode_provider_core::CHATGPT_WEB_MODEL
+    {
+        return Some("chatgpt-web".to_string());
+    }
+
+    match (provider, credential) {
+        (Some(ActiveProvider::Claude), Some(ResolvedCredential::Oauth)) => {
+            Some("claude-oauth".to_string())
+        }
+        (Some(ActiveProvider::Claude), Some(ResolvedCredential::ApiKey)) => {
+            Some("claude-api".to_string())
+        }
+        (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::Oauth)) => {
+            Some("openai-oauth".to_string())
+        }
+        (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::ApiKey)) => {
+            Some("openai-api".to_string())
+        }
+        _ => session_api_method.map(str::to_string),
+    }
+}
+
 impl App {
     fn format_failover_count(value: usize) -> String {
         match value {
@@ -198,8 +231,8 @@ impl App {
     pub(super) fn current_route_api_method(&self) -> Option<String> {
         // Session route metadata records a past selection, not necessarily the
         // credential now in use (e.g. after /account or a remote route switch).
-        // Prefer the same authoritative credential that drives billing identity
-        // so we never offer the active route as its own fallback.
+        // Resolve browser transport first, then use the authoritative credential
+        // for native routes so neither path offers itself as its own fallback.
         let provider =
             jcode_provider_core::parse_provider_hint(&self.current_provider_label_for_fallback());
         let credential = if self.is_remote {
@@ -207,22 +240,12 @@ impl App {
         } else {
             self.provider.active_resolved_credential()
         };
-        use jcode_provider_core::{ActiveProvider, ResolvedCredential};
-        match (provider, credential) {
-            (Some(ActiveProvider::Claude), Some(ResolvedCredential::Oauth)) => {
-                Some("claude-oauth".to_string())
-            }
-            (Some(ActiveProvider::Claude), Some(ResolvedCredential::ApiKey)) => {
-                Some("claude-api".to_string())
-            }
-            (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::Oauth)) => {
-                Some("openai-oauth".to_string())
-            }
-            (Some(ActiveProvider::OpenAI), Some(ResolvedCredential::ApiKey)) => {
-                Some("openai-api".to_string())
-            }
-            _ => self.session.route_api_method.clone(),
-        }
+        route_api_method_for_active_model(
+            provider,
+            &self.current_model_for_fallback(),
+            credential,
+            self.session.route_api_method.as_deref(),
+        )
     }
 
     fn current_provider_label_for_fallback(&self) -> String {
@@ -1942,4 +1965,149 @@ pub(super) fn unavailable_model_route_message(
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod chatgpt_web_fallback_tests {
+    use super::route_api_method_for_active_model;
+    use jcode_provider_core::{
+        ActiveProvider, CHATGPT_WEB_MODEL, FallbackPickOptions, ModelRoute, ResolvedCredential,
+        pick_next_fallback_route_with_options,
+    };
+
+    fn route(model: &str, api_method: &str) -> ModelRoute {
+        ModelRoute {
+            model: model.to_string(),
+            provider: "OpenAI".to_string(),
+            api_method: api_method.to_string(),
+            available: true,
+            detail: String::new(),
+            usage: None,
+            cheapness: None,
+        }
+    }
+
+    #[test]
+    fn chatgpt_web_fallback_uses_browser_method_despite_saved_credentials() {
+        for credential in [
+            None,
+            Some(ResolvedCredential::Oauth),
+            Some(ResolvedCredential::ApiKey),
+        ] {
+            for session_method in [None, Some("openai-oauth"), Some("openai-api")] {
+                assert_eq!(
+                    route_api_method_for_active_model(
+                        Some(ActiveProvider::OpenAI),
+                        CHATGPT_WEB_MODEL,
+                        credential,
+                        session_method,
+                    )
+                    .as_deref(),
+                    Some("chatgpt-web"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chatgpt_web_fallback_preserves_native_credential_precedence() {
+        for (provider, credential, expected) in [
+            (ActiveProvider::OpenAI, ResolvedCredential::Oauth, "openai-oauth"),
+            (ActiveProvider::OpenAI, ResolvedCredential::ApiKey, "openai-api"),
+            (ActiveProvider::Claude, ResolvedCredential::Oauth, "claude-oauth"),
+            (ActiveProvider::Claude, ResolvedCredential::ApiKey, "claude-api"),
+        ] {
+            assert_eq!(
+                route_api_method_for_active_model(
+                    Some(provider),
+                    "native-model",
+                    Some(credential),
+                    Some("chatgpt-web"),
+                )
+                .as_deref(),
+                Some(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_web_fallback_does_not_override_other_providers() {
+        for provider in [None, Some(ActiveProvider::OpenRouter)] {
+            assert_eq!(
+                route_api_method_for_active_model(
+                    provider,
+                    CHATGPT_WEB_MODEL,
+                    Some(ResolvedCredential::Oauth),
+                    Some("custom-route"),
+                )
+                .as_deref(),
+                Some("custom-route"),
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_web_fallback_never_reoffers_active_browser_route() {
+        let method = route_api_method_for_active_model(
+            Some(ActiveProvider::OpenAI),
+            CHATGPT_WEB_MODEL,
+            Some(ResolvedCredential::Oauth),
+            Some("openai-oauth"),
+        )
+        .unwrap();
+        let routes = [
+            route(CHATGPT_WEB_MODEL, "chatgpt-web"),
+            route("native-model", "openai-oauth"),
+        ];
+        for credential_failure in [false, true] {
+            let options = FallbackPickOptions { credential_failure };
+            assert_eq!(
+                pick_next_fallback_route_with_options(
+                    &routes[..1],
+                    CHATGPT_WEB_MODEL,
+                    "OpenAI",
+                    &method,
+                    options,
+                ),
+                None,
+            );
+            assert_eq!(
+                pick_next_fallback_route_with_options(
+                    &routes,
+                    CHATGPT_WEB_MODEL,
+                    "OpenAI",
+                    &method,
+                    options,
+                ),
+                Some(1),
+            );
+        }
+    }
+
+    #[test]
+    fn chatgpt_web_fallback_remains_available_after_native_oauth_failure() {
+        let method = route_api_method_for_active_model(
+            Some(ActiveProvider::OpenAI),
+            "native-model",
+            Some(ResolvedCredential::Oauth),
+            Some("chatgpt-web"),
+        )
+        .unwrap();
+        let routes = [
+            route("native-model", "openai-oauth"),
+            route(CHATGPT_WEB_MODEL, "chatgpt-web"),
+        ];
+        assert_eq!(
+            pick_next_fallback_route_with_options(
+                &routes,
+                "native-model",
+                "OpenAI",
+                &method,
+                FallbackPickOptions {
+                    credential_failure: true,
+                },
+            ),
+            Some(1),
+        );
+    }
 }

@@ -720,7 +720,10 @@ pub enum RuntimeKey {
     CodeAssistOAuth,
     RemoteCatalog,
     Current,
-    Other(String),
+    // Internally tagged variants need an object payload, not a bare string.
+    Other {
+        value: String,
+    },
 }
 
 impl RuntimeKey {
@@ -742,7 +745,9 @@ impl RuntimeKey {
             ModelRouteApiMethod::AntigravityHttps => Self::Antigravity,
             ModelRouteApiMethod::RemoteCatalog => Self::RemoteCatalog,
             ModelRouteApiMethod::Current => Self::Current,
-            ModelRouteApiMethod::Other(method) => Self::Other(method.clone()),
+            ModelRouteApiMethod::Other(method) => Self::Other {
+                value: method.clone(),
+            },
         }
     }
 
@@ -766,7 +771,7 @@ impl RuntimeKey {
             Self::CodeAssistOAuth => "code-assist-oauth".to_string(),
             Self::RemoteCatalog => "remote-catalog".to_string(),
             Self::Current => "current".to_string(),
-            Self::Other(value) => value.clone(),
+            Self::Other { value } => value.clone(),
         }
     }
 }
@@ -839,7 +844,7 @@ impl RouteSelection {
             | RuntimeKey::CodeAssistOAuth
             | RuntimeKey::RemoteCatalog
             | RuntimeKey::Current
-            | RuntimeKey::Other(_) => model.to_string(),
+            | RuntimeKey::Other { .. } => model.to_string(),
         }
     }
 }
